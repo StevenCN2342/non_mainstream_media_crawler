@@ -14,6 +14,7 @@ from unittest.mock import patch
 import uuid
 
 from config.sites import SiteConfigError, SiteRegistry
+from crawler.discovery import discover_articles, extract_links, RobotsPolicy
 import main as crawler_main
 import daily_crawler
 from storage.task_journal import TaskJournal
@@ -49,12 +50,15 @@ class SiteRegistryTests(unittest.TestCase):
                 sites:
                   - name: Alpha News
                     url: https://alpha.example/news
+                    aliases:
+                      - Alpha Daily
                   - name: Beta Media
                     url: https://beta.example/article
                 """,
             )
             registry = SiteRegistry(path)
             self.assertEqual(registry.find("alpha")["name"], "Alpha News")
+            self.assertEqual(registry.find("Alpha Daily")["name"], "Alpha News")
             self.assertEqual(
                 registry.urls(all_sites=True),
                 ["https://alpha.example/news", "https://beta.example/article"],
@@ -219,6 +223,107 @@ class CrawlJournalIntegrationTests(unittest.TestCase):
                     crawler_main.RUN_LOCK,
                     crawler_main.TASK_DB,
                 ) = previous_values
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_limits_article_links_per_listing_page(self):
+        home = "https://site.example/"
+        first = "".join(
+            f'<a href="/{100000 + i}.html">第{i}篇文章</a>' for i in range(8)
+        ) + '<a href="/news">新闻栏目</a>'
+        second = "".join(
+            f'<a href="/{200000 + i}.html">第{i}篇文章</a>' for i in range(8)
+        )
+        with patch.object(RobotsPolicy, "load", return_value=True), \
+                patch.object(RobotsPolicy, "allows", return_value=True), \
+                patch("crawler.discovery.Downloader.fetch",
+                      side_effect=lambda url: {home: first, home + "news": second}[url]) as fetch, \
+                patch("crawler.discovery.time.sleep"):
+            found = discover_articles(home, max_articles=25, max_pages=2,
+                                      max_articles_per_page=5)
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(found, [home + f"{100000 + i}.html" for i in range(5)] +
+                         [home + f"{200000 + i}.html" for i in range(5)])
+
+    def test_robots_denial_and_homepage_failure_are_reported(self):
+        with patch("crawler.discovery.requests.get") as get:
+            get.return_value.status_code = 403
+            self.assertFalse(RobotsPolicy("https://site.example/").load())
+            with self.assertRaisesRegex(ValueError, "robots.txt"):
+                discover_articles("https://site.example/")
+            get.return_value.status_code = 404
+            with patch("crawler.discovery.Downloader.fetch", return_value=""):
+                with self.assertRaisesRegex(ValueError, "首页下载失败"):
+                    discover_articles("https://site.example/")
+
+    def test_extracts_article_and_channel_only_on_same_site(self):
+        html = (
+            '<a href="/8146619.html">一篇测试文章</a>'
+            '<a href="/detail/2488683">另一篇测试文章</a>'
+            '<a href="/news">最新新闻</a>'
+            '<a href="https://other.example/999999.html">外部文章</a>'
+            '<a href="/image.jpg">图片</a>'
+        )
+        articles, channels = extract_links(html, "https://site.example/",
+                                           "https://site.example/")
+        self.assertEqual(articles, ["https://site.example/8146619.html",
+                                    "https://site.example/detail/2488683"])
+        self.assertEqual(channels, ["https://site.example/news"])
+
+    def test_site_mode_discovers_and_saves_articles_not_homepage(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                pages = {
+                    "/robots.txt": "User-agent: *\nDisallow: /blocked/\n",
+                    "/": '<a href="/news">新闻栏目</a><a href="/123456.html">第一篇文章</a>'
+                         '<a href="/blocked/888888.html">被禁止的文章</a>',
+                    "/news": '<a href="/detail/234567">第二篇文章</a>',
+                    "/123456.html": "<html><title>第一篇文章</title><p>第一篇正文内容。</p></html>",
+                    "/detail/234567": "<html><title>第二篇文章</title><p>第二篇正文内容。</p></html>",
+                }
+                body = pages.get(self.path)
+                self.send_response(200 if body else 404)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                if body:
+                    self.wfile.write(body.encode("utf-8"))
+
+            def log_message(self, format, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        previous_values = (crawler_main.RUNTIME_DIR, crawler_main.RUN_LOCK,
+                           crawler_main.TASK_DB)
+        previous_cwd = Path.cwd()
+        try:
+            with test_directory() as folder:
+                folder = Path(folder)
+                crawler_main.RUNTIME_DIR = folder / ".runtime"
+                crawler_main.RUN_LOCK = crawler_main.RUNTIME_DIR / "crawler.lock"
+                crawler_main.TASK_DB = crawler_main.RUNTIME_DIR / "tasks.sqlite3"
+                os.chdir(folder)
+                home = f"http://127.0.0.1:{server.server_port}/"
+                args = SimpleNamespace(retry_failed=False, workers=1,
+                                       memory_limit_mib=100, max_response_mib=1,
+                                       max_articles_per_site=10, max_pages_per_site=3,
+                                       max_articles_per_page=10)
+                site = {"name": "测试站", "url": home, "category": "测试"}
+                self.assertEqual(crawler_main.run_crawl(args, [], [site]), 0)
+                self.assertEqual(crawler_main.run_crawl(args, [], [site]), 0)
+                rows = (folder / "articles.json").read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(rows), 2)
+                self.assertEqual({__import__("json").loads(row)["url"] for row in rows},
+                                 {home + "123456.html", home + "detail/234567"})
+                self.assertEqual(TaskJournal(crawler_main.TASK_DB).counts(), {"done": 2})
+        finally:
+            os.chdir(previous_cwd)
+            (crawler_main.RUNTIME_DIR, crawler_main.RUN_LOCK,
+             crawler_main.TASK_DB) = previous_values
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
 
 if __name__ == "__main__":

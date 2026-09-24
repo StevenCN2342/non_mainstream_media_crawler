@@ -10,6 +10,7 @@ import tempfile
 from config.sites import SiteConfigError, SiteRegistry
 from crawler.crawler import Crawler
 from crawler.downloader import Downloader
+from crawler.discovery import discover_articles
 from storage.json_writer import JsonWriter
 from storage.sqlite import SQLiteStorage
 from storage.task_journal import TaskJournal
@@ -30,12 +31,18 @@ def build_parser():
     parser.add_argument("--url", action="append", help="文章 URL；可重复提供")
     parser.add_argument("--urls-file", help="每行一个 URL 的文本文件")
     parser.add_argument("--site", action="append", help="sites.yaml 中的站点名称")
-    parser.add_argument("--all-sites", action="store_true", help="抓取 sites.yaml 全部 URL")
+    parser.add_argument("--all-sites", action="store_true", help="从全部站点发现文章 URL 并抓取")
     parser.add_argument("--sites-file", default=str(DEFAULT_SITES))
     parser.add_argument("--list-sites", action="store_true")
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--memory-limit-mib", type=int, default=100)
     parser.add_argument("--max-response-mib", type=int, default=20)
+    parser.add_argument("--max-articles-per-site", type=int, default=10,
+                        help="每站每轮最多发现的文章 URL，默认 10")
+    parser.add_argument("--max-pages-per-site", type=int, default=3,
+                        help="每站每轮最多读取的首页/栏目页，默认 3")
+    parser.add_argument("--max-articles-per-page", type=int, default=10,
+                        help="每个首页/栏目页最多选取的文章链接，默认 10")
     parser.add_argument("--task-status", action="store_true")
     parser.add_argument("--retry-task", metavar="URL")
     parser.add_argument("--retry-failed", action="store_true")
@@ -52,10 +59,17 @@ def load_urls(args):
                 for line in handle
                 if line.strip() and not line.lstrip().startswith("#")
             )
-    if args.site or args.all_sites:
-        registry = SiteRegistry(args.sites_file)
-        urls.extend(registry.urls(args.site, args.all_sites))
     return list(dict.fromkeys(urls))
+
+
+def load_sites(args):
+    if not (args.site or args.all_sites):
+        return []
+    registry = SiteRegistry(args.sites_file)
+    if args.all_sites:
+        return registry.list()
+    return list({site["name"]: site for site in
+                 (registry.find(name) for name in args.site)}.values())
 
 
 def run_worker(request_path, result_path):
@@ -64,16 +78,23 @@ def run_worker(request_path, result_path):
     limit_bytes = int(request["memory_limit_mib"] * 1024 * 1024)
     stopped = start_self_watchdog(limit_bytes, request["parent_pid"])
     try:
-        crawler = Crawler(
-            downloader=Downloader(
-                max_bytes=int(request["max_response_mib"] * 1024 * 1024)
+        if request.get("mode") == "discover":
+            result = discover_articles(
+                request["url"], request["max_articles"],
+                request["max_pages"], request["max_response_mib"],
+                request.get("max_articles_per_page", 10),
             )
-        )
-        article = crawler.crawl_url(request["url"])
-        if not article:
-            raise ValueError("没有抓取到可保存的文章")
+        else:
+            crawler = Crawler(
+                downloader=Downloader(
+                    max_bytes=int(request["max_response_mib"] * 1024 * 1024)
+                )
+            )
+            result = crawler.crawl_url(request["url"])
+            if not result or not result.get("title") or not result.get("content"):
+                raise ValueError("没有抓取到标题和正文完整的文章")
         with open(result_path, "w", encoding="utf-8") as handle:
-            json.dump({"article": article}, handle, ensure_ascii=False)
+            json.dump({"result": result}, handle, ensure_ascii=False)
         return 0
     except Exception as exc:
         with open(result_path, "w", encoding="utf-8") as handle:
@@ -83,7 +104,9 @@ def run_worker(request_path, result_path):
         stopped.set()
 
 
-def crawl_in_subprocess(url, memory_limit_mib, max_response_mib):
+def crawl_in_subprocess(url, memory_limit_mib, max_response_mib, *,
+                        mode="article", max_articles=10, max_pages=3,
+                        max_articles_per_page=10):
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     paths = []
     try:
@@ -100,6 +123,10 @@ def crawl_in_subprocess(url, memory_limit_mib, max_response_mib):
                     "parent_pid": os.getpid(),
                     "memory_limit_mib": memory_limit_mib,
                     "max_response_mib": max_response_mib,
+                    "mode": mode,
+                    "max_articles": max_articles,
+                    "max_pages": max_pages,
+                    "max_articles_per_page": max_articles_per_page,
                 },
                 handle,
                 ensure_ascii=False,
@@ -129,10 +156,10 @@ def crawl_in_subprocess(url, memory_limit_mib, max_response_mib):
                 pass
             raise RuntimeError(error)
         with open(result_path, encoding="utf-8") as handle:
-            article = json.load(handle)["article"]
+            result = json.load(handle)["result"]
         if peak:
             print(f"Worker memory peak: {peak // 1024 // 1024} MiB")
-        return article
+        return result
     finally:
         for path in paths:
             try:
@@ -147,9 +174,13 @@ def print_task_status(journal):
         print(json.dumps(row, ensure_ascii=False))
 
 
-def process_result(crawler, journal, url, future):
+def process_result(crawler, journal, url, future, site=None):
     try:
-        crawler.save_article(future.result())
+        article = future.result()
+        if site:
+            article["site_name"] = site["name"]
+            article["category"] = site.get("category", "")
+        crawler.save_article(article)
         journal.set_status(url, "done")
         return True
     except MemoryLimitExceeded as exc:
@@ -161,17 +192,42 @@ def process_result(crawler, journal, url, future):
     return False
 
 
-def run_crawl(args, urls):
+def run_crawl(args, urls, sites=None):
     with ProcessLock(RUN_LOCK):
         journal = TaskJournal(TASK_DB, recover=True)
         if args.retry_failed:
             print(f"已恢复 {journal.retry_failed()} 个失败任务。")
+        site_for_url = {}
+        discovery_failures = 0
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            discoveries = {
+                executor.submit(
+                    crawl_in_subprocess, site["url"], args.memory_limit_mib,
+                    args.max_response_mib, mode="discover",
+                    max_articles=args.max_articles_per_site,
+                    max_pages=args.max_pages_per_site,
+                    max_articles_per_page=args.max_articles_per_page,
+                ): site for site in sites or []
+            }
+            for future in as_completed(discoveries):
+                site = discoveries[future]
+                try:
+                    found = future.result()
+                    print(f"发现文章：{site['name']} {len(found)} 条")
+                    for url in found:
+                        site_for_url.setdefault(url, site)
+                    urls.extend(found)
+                except Exception as exc:
+                    discovery_failures += 1
+                    print(f"站点发现失败：{site['name']} {exc}")
+        urls = list(dict.fromkeys(urls))
         journal.add_many(urls)
         pending = journal.pending_urls(urls)
         if not pending:
             counts = journal.counts(urls)
             print("本次范围没有待处理任务：" + json.dumps(counts, ensure_ascii=False))
-            return 0 if not (counts.get("failed") or counts.get("deferred")) else 2
+            return 0 if not (counts.get("failed") or counts.get("deferred") or
+                             discovery_failures) else 2
 
         crawler = Crawler(SQLiteStorage(), JsonWriter())
         succeeded = 0
@@ -188,7 +244,9 @@ def run_crawl(args, urls):
                     )
                     futures[future] = url
                 for future in as_completed(futures):
-                    succeeded += process_result(crawler, journal, futures[future], future)
+                    url = futures[future]
+                    succeeded += process_result(crawler, journal, url, future,
+                                                site_for_url.get(url))
         finally:
             for resource in (crawler.writer, crawler.storage):
                 close = getattr(resource, "close", None)
@@ -196,7 +254,7 @@ def run_crawl(args, urls):
                     close()
         failed = len(pending) - succeeded
         print(f"本轮完成：成功 {succeeded}，失败或延后 {failed}。")
-        if failed == 0:
+        if failed == 0 and discovery_failures == 0:
             return 0
         counts = journal.counts(urls)
         return 3 if counts.get("deferred") and not counts.get("failed") else 2
@@ -215,6 +273,9 @@ def main(argv=None):
         parser.error("--memory-limit-mib 至少设置为 16")
     if args.max_response_mib < 1:
         parser.error("--max-response-mib 至少设置为 1")
+    if (args.max_articles_per_site < 1 or args.max_pages_per_site < 1
+            or args.max_articles_per_page < 1):
+        parser.error("每站文章数、页面数及每页文章数上限必须大于 0")
 
     try:
         if args.list_sites:
@@ -230,9 +291,10 @@ def main(argv=None):
             print(f"已恢复 {changed} 个任务。")
             return 0 if changed else 1
         urls = load_urls(args)
-        if not urls:
+        sites = load_sites(args)
+        if not urls and not sites:
             parser.error("请提供 --url、--urls-file、--site 或 --all-sites")
-        return run_crawl(args, urls)
+        return run_crawl(args, urls, sites)
     except AlreadyRunning:
         print("已有一个爬虫实例正在运行，本次退出。")
         return BUSY_EXIT_CODE

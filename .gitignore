@@ -1,7 +1,16 @@
 .venv/
+.env
+.env.*
 .runtime/
 .test-work/
 __pycache__/
 *.py[cod]
 articles.db
 articles.json
+article_urls.txt
+*.log
+*.out
+*.pid
+*.lock
+*.sqlite
+*.sqlite3

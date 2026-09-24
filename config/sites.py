@@ -27,7 +27,7 @@ class SiteRegistry:
             raise SiteConfigError("站点配置必须包含 sites 列表")
 
         sites = []
-        names = set()
+        identifiers = set()
         for index, row in enumerate(rows, 1):
             if not isinstance(row, dict):
                 raise SiteConfigError(f"sites 第 {index} 项必须是对象")
@@ -35,13 +35,20 @@ class SiteRegistry:
             url = str(row.get("url", "")).strip()
             if not name or not url:
                 raise SiteConfigError(f"sites 第 {index} 项缺少 name 或 url")
-            if name.casefold() in names:
+            aliases = row.get("aliases", [])
+            if not isinstance(aliases, list) or any(
+                not isinstance(alias, str) or not alias.strip() for alias in aliases
+            ):
+                raise SiteConfigError(f"sites 第 {index} 项 aliases 必须是非空字符串列表")
+            labels = [name, *(alias.strip() for alias in aliases)]
+            folded = [label.casefold() for label in labels]
+            if len(folded) != len(set(folded)) or identifiers.intersection(folded):
                 raise SiteConfigError(f"站点名称重复：{name}")
             parsed = urlparse(url)
             if parsed.scheme not in ("http", "https") or not parsed.netloc:
                 raise SiteConfigError(f"站点 URL 无效：{url}")
-            names.add(name.casefold())
-            sites.append({**row, "name": name, "url": url})
+            identifiers.update(folded)
+            sites.append({**row, "name": name, "url": url, "aliases": aliases})
         return sites
 
     def list(self):
@@ -49,10 +56,25 @@ class SiteRegistry:
 
     def find(self, query):
         query = query.strip().casefold()
-        exact = [site for site in self.sites if site["name"].casefold() == query]
+        exact = [
+            site
+            for site in self.sites
+            if site["name"].casefold() == query
+            or query in {
+                str(alias).casefold() for alias in site.get("aliases", [])
+            }
+        ]
         if exact:
             return exact[0]
-        matches = [site for site in self.sites if query in site["name"].casefold()]
+        matches = [
+            site
+            for site in self.sites
+            if query in site["name"].casefold()
+            or any(
+                query in str(alias).casefold()
+                for alias in site.get("aliases", [])
+            )
+        ]
         if not matches:
             raise SiteConfigError(f"没有找到站点：{query}")
         if len(matches) > 1:
