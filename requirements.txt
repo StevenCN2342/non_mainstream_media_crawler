@@ -1,0 +1,7 @@
+
+requests
+charset-normalizer
+beautifulsoup4
+lxml
+pyyaml
+feedparser

@@ -1,0 +1,9 @@
+
+sites:
+
+  - name: example
+
+    url: https://example.com
+
+    adapter: auto
+
