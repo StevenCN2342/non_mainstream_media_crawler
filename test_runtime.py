@@ -13,12 +13,29 @@ import unittest
 from unittest.mock import patch
 import uuid
 
+from article_schema import CANONICAL_FIELDS, normalize_article
 from config.sites import SiteConfigError, SiteRegistry
 from crawler.discovery import discover_articles, extract_links, RobotsPolicy
 import main as crawler_main
 import daily_crawler
 from storage.task_journal import TaskJournal
 from utils.process_lock import ProcessLock
+
+
+class ArticleSchemaTests(unittest.TestCase):
+    def test_fixed_fields_order_and_empty_optional_values(self):
+        record = normalize_article({
+            "url": "https://article.example/one",
+            "title": "标题",
+            "content": "正文",
+            "site_name": "测试站",
+            "source": "   ",
+        })
+        self.assertEqual(tuple(record), CANONICAL_FIELDS)
+        self.assertEqual(record["siteName"], "测试站")
+        self.assertIsNone(record["source"])
+        self.assertEqual(record["images"], [])
+        self.assertIsNone(record["indexNumber"])
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -214,7 +231,12 @@ class CrawlJournalIntegrationTests(unittest.TestCase):
                     self.assertEqual(crawler_main.run_crawl(args, [url]), 0)
                     self.assertEqual(crawler_main.run_crawl(args, [url]), 0)
                     self.assertEqual(crawl.call_count, 1)
-                self.assertIn('"title": "saved"', (folder / "articles.json").read_text())
+                saved = __import__("json").loads(
+                    (folder / "articles.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(tuple(saved), CANONICAL_FIELDS)
+                self.assertEqual(saved["title"], "saved")
+                self.assertEqual(saved["images"], [])
                 self.assertEqual(TaskJournal(crawler_main.TASK_DB).counts(), {"done": 1})
             finally:
                 os.chdir(previous_cwd)

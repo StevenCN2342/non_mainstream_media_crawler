@@ -1,5 +1,6 @@
 import threading
 
+from article_schema import normalize_article
 from crawler.downloader import Downloader
 from detector.media_detector import MediaDetector
 from adapter.factory import AdapterFactory
@@ -32,6 +33,7 @@ class Crawler:
         if not article:
             return
 
+        article = normalize_article(article)
         with self._save_lock:
             if self.storage:
                 self.storage.save(article)

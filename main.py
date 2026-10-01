@@ -178,7 +178,7 @@ def process_result(crawler, journal, url, future, site=None):
     try:
         article = future.result()
         if site:
-            article["site_name"] = site["name"]
+            article["siteName"] = site["name"]
             article["category"] = site.get("category", "")
         crawler.save_article(article)
         journal.set_status(url, "done")

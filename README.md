@@ -83,7 +83,29 @@ sites:
 python scripts/import_v9_report.py /path/to/report_v9.md config/sites.yaml
 ```
 
-文章保存在项目目录下的 `articles.db` 和 `articles.json`，任务状态保存在 `.runtime/tasks.sqlite3`。`articles.json` 的站点模式结果还包含 `site_name` 和 `category`。如果某网站页面能访问但没有可解析的标题和正文，文章任务会标为 `failed`，不会把空文章当成成功。
+文章固定保存在项目目录下的 `articles.db` 和 `articles.json`，任务状态保存在 `.runtime/tasks.sqlite3`。
+
+`articles.json` 实际采用 JSON Lines：每行一个紧凑 JSON object。直接 URL 与站点模式都会写出同样的固定 13 字段结构：
+
+```json
+{
+  "url": "https://example.com/news/1",
+  "title": "新闻标题",
+  "content": "新闻正文",
+  "siteName": "媒体或网站名称",
+  "source": null,
+  "category": "媒体分类",
+  "subCategory": null,
+  "channel": null,
+  "publishTime": null,
+  "images": [],
+  "crawledAt": null,
+  "docNumber": null,
+  "indexNumber": null
+}
+```
+
+字段顺序与现有转换后数据一致。URL、标题、正文必须是字符串，且 URL 和标题不能为空；缺失或空白的可选字符串写为 `null`，缺失图片写为 `[]`。站点模式会填写 `siteName` 和 `category`，直接 URL 无法可靠判断时保留为 `null`。新写出的 JSONL 无需再次运行 converter。`articles.db` 继续保持原有的 URL、标题、正文三项存储结构。如果某网站页面能访问但没有可解析的标题和正文，文章任务会标为 `failed`，不会把空文章当成成功。
 
 ## 内存与并发
 

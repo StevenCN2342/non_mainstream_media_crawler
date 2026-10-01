@@ -18,6 +18,7 @@ class JsonWriter:
                 json.dumps(
                     article,
                     ensure_ascii=False,
+                    separators=(",", ":"),
                 )
                 + "\n"
             )
