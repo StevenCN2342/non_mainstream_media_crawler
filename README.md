@@ -1,6 +1,6 @@
 # 非官方媒体爬虫
 
-这是一个支持多线程调度、网页子进程隔离、进程锁、内存保护、断点任务记录和独立循环调度器的 Python 爬虫。
+这是一个支持多线程调度、网页子进程隔离、进程锁、内存保护、断点任务记录和每日定时调度器的 Python 爬虫。
 
 ## 运行结构
 
@@ -137,7 +137,7 @@ python scripts/import_v9_report.py /path/to/report_v9.md config/sites.yaml
 
 成功任务再次出现在输入中时会直接跳过。突然断电如果刚好发生在文章写入之后、任务标记为 `done` 之前，JSONL 仍存在小概率重复窗口；SQLite 的 `url UNIQUE` 不会重复插入。
 
-## 独立调度器
+## 每天 18:00 定时调度器
 
 先只检查参数：
 
@@ -145,7 +145,6 @@ python scripts/import_v9_report.py /path/to/report_v9.md config/sites.yaml
 .venv/bin/python daily_crawler.py \
   --check \
   --loop-count 50 \
-  --interval-seconds 86400 \
   --retry-seconds 60 \
   -- --all-sites --workers 2 --memory-limit-mib 100
 ```
@@ -155,17 +154,21 @@ python scripts/import_v9_report.py /path/to/report_v9.md config/sites.yaml
 ```bash
 nohup .venv/bin/python -u daily_crawler.py \
   --loop-count 50 \
-  --interval-seconds 86400 \
   --retry-seconds 60 \
   -- --all-sites --workers 2 --memory-limit-mib 100 \
   > .runtime/scheduler-console.log 2>&1 &
 ```
 
-- `--loop-count 0` 表示持续运行；正整数表示完成多少个成功轮次后退出。
-- `--interval-seconds` 从一轮成功结束到下一轮启动之间计算。
+- 调度器常驻运行，每天北京时间 18:00 开始当天批次；`--loop-count` 表示每天执行的轮数，默认 50，必须大于 0。
+- 当天各轮连续执行；完成 50 轮后等待次日 18:00，不退出调度器。
+- `--interval-seconds` 仅为兼容旧命令而保留，只能省略或设为 `0`；不能再设置为 `86400`。
 - 普通失败按 `--retry-seconds` 重试，调度器会自动加入 `--retry-failed`。
 - 内存延后任务保留为 `deferred`，需提高限制后用 `--retry-task` 恢复。
 - 各轮日志位于 `.runtime/scheduler_logs/`。
+
+若启动调度器时当天 18:00 已经过，则等待次日 18:00，不补跑已经错过的批次。
+若当天 50 轮跨过下一天 18:00，不会重叠启动另一批；当前批完成后等待下一个尚未到来的 18:00。
+定时使用固定的北京时间 UTC+8，不依赖服务器本地时区配置。`--check` 会显示按当前时间计算的下一次启动时间。
 
 停止调度器只停止后续调度，已启动的主爬虫继续完成当前轮；主爬虫仍持有运行锁，因此重新启动调度器不会造成重叠。
 

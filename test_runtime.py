@@ -1,5 +1,6 @@
 import os
 from contextlib import contextmanager
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import shutil
@@ -200,6 +201,21 @@ class SchedulerTests(unittest.TestCase):
     def test_scheduler_rejects_read_only_action(self):
         with self.assertRaises(ValueError):
             daily_crawler.normalize_crawler_args(["--", "--task-status"])
+
+    def test_default_daily_batch_has_fifty_rounds(self):
+        self.assertEqual(
+            daily_crawler.build_parser().parse_args([]).loop_count, 50
+        )
+
+    def test_next_daily_run_is_1800_china_time(self):
+        tz = daily_crawler.schedule_timezone()
+        before = datetime(2026, 10, 14, 17, 59, tzinfo=tz)
+        at_time = datetime(2026, 10, 14, 18, 0, tzinfo=tz)
+        self.assertEqual(daily_crawler.next_scheduled_time(before), at_time)
+        self.assertEqual(
+            daily_crawler.next_scheduled_time(at_time),
+            datetime(2026, 10, 15, 18, 0, tzinfo=tz),
+        )
 
 
 class CrawlJournalIntegrationTests(unittest.TestCase):

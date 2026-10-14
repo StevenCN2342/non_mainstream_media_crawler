@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 from pathlib import Path
@@ -22,6 +22,11 @@ BUSY_EXIT_CODE = crawler_main.BUSY_EXIT_CODE
 PARTIAL_EXIT_CODE = 2  # 主爬虫已遍历完本轮，但有站点或文章失败
 DEFERRED_EXIT_CODE = 3
 log = logging.getLogger("NonMainstreamScheduler")
+DAILY_HOUR = 18
+DAILY_MINUTE = 0
+UTC_OFFSET_HOURS = 8
+DEFAULT_LOOP_COUNT = 50
+POLL_SECONDS = 1
 
 
 def build_parser():
@@ -30,12 +35,12 @@ def build_parser():
     )
     parser.add_argument(
         "--interval-seconds", type=int, default=0,
-        help="兼容旧命令；只允许 0，完成一轮后立即开始下一轮",
+        help="兼容旧命令；只允许 0，每天的各轮之间立即连续运行",
     )
     parser.add_argument("--retry-seconds", type=int, default=60)
     parser.add_argument(
-        "--loop-count", type=int, default=1,
-        help="完成遍历的轮数（个别失败仍计入）；0 表示持续运行"
+        "--loop-count", type=int, default=DEFAULT_LOOP_COUNT,
+        help="每天完成遍历的轮数（默认 50；个别失败仍计入）"
     )
     parser.add_argument("--check", action="store_true")
     parser.add_argument(
@@ -62,6 +67,19 @@ def normalize_crawler_args(values):
     return values
 
 
+def schedule_timezone():
+    return timezone(timedelta(hours=UTC_OFFSET_HOURS))
+
+
+def next_scheduled_time(now):
+    """返回 now 之后最近一次北京时间每日开跑时间。"""
+    target = now.replace(hour=DAILY_HOUR, minute=DAILY_MINUTE,
+                         second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target
+
+
 def launch_crawler(arguments, now=None):
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     now = now or datetime.now()
@@ -86,39 +104,30 @@ def launch_crawler(arguments, now=None):
     return process
 
 
-def run_scheduler(arguments, retry_delay, loop_count):
+def run_scheduler(arguments, retry_delay, loop_count, should_stop=lambda: False):
     completed = 0
     attempt = 0  # 当前轮已实际启动的采集尝试；完成遍历后归零
     process = None
     next_launch = 0.0
-    stopping = False
-
-    def request_stop(signum, frame):
-        nonlocal stopping
-        stopping = True
-
-    signal.signal(signal.SIGINT, request_stop)
-    signal.signal(signal.SIGTERM, request_stop)
-
-    while not stopping and (loop_count == 0 or completed < loop_count):
+    while not should_stop() and completed < loop_count:
         now = time.monotonic()
         if process is not None:
             code = process.poll()
             if code is None:
-                time.sleep(1)
+                time.sleep(POLL_SECONDS)
                 continue
             process = None
             if code in (0, PARTIAL_EXIT_CODE, DEFERRED_EXIT_CODE):
                 if code == 0:
                     log.info("第 %s/%s 轮遍历完成，无失败；共尝试 %s 次，重试 %s 次",
-                             completed + 1, loop_count or "∞", attempt,
+                             completed + 1, loop_count, attempt,
                              max(0, attempt - 1))
                 elif code == PARTIAL_EXIT_CODE:
                     log.warning(
                         "第 %s/%s 轮遍历完成，但有站点或文章失败（退出码=%s）；"
                         "仍计入轮数，共尝试 %s 次，重试 %s 次；"
                         "站点失败见采集日志，文章失败保留任务记录",
-                        completed + 1, loop_count or "∞", code,
+                        completed + 1, loop_count, code,
                         attempt, max(0, attempt - 1),
                     )
                 else:
@@ -126,22 +135,22 @@ def run_scheduler(arguments, retry_delay, loop_count):
                         "第 %s/%s 轮遍历完成，但有内存延后任务（退出码=%s）；"
                         "仍计入轮数，共尝试 %s 次，重试 %s 次；"
                         "延后任务保留记录，不视为采集成功",
-                        completed + 1, loop_count or "∞", code,
+                        completed + 1, loop_count, code,
                         attempt, max(0, attempt - 1),
                     )
                 completed += 1
                 attempt = 0
-                if loop_count and completed >= loop_count:
+                if completed >= loop_count:
                     log.info("目标轮次全部完成：%s/%s", completed, loop_count)
                 else:
                     log.info("累计完成遍历 %s/%s 轮；立即开始下一轮",
-                             completed, loop_count or "∞")
+                             completed, loop_count)
                     next_launch = now
             elif code == BUSY_EXIT_CODE:
                 log.info(
                     "第 %s/%s 轮第 %s 次尝试未启动：其他采集进程仍在运行；"
                     "%s 秒后进行第 %s 次尝试",
-                    completed + 1, loop_count or "∞", attempt,
+                    completed + 1, loop_count, attempt,
                     retry_delay, attempt + 1,
                 )
                 next_launch = now + retry_delay
@@ -149,7 +158,7 @@ def run_scheduler(arguments, retry_delay, loop_count):
                 log.error(
                     "第 %s/%s 轮第 %s 次尝试异常中断，退出码=%s；"
                     "不计入轮数，%s 秒后进行第 %s 次尝试",
-                    completed + 1, loop_count or "∞", attempt,
+                    completed + 1, loop_count, attempt,
                     code, retry_delay, attempt + 1,
                 )
                 next_launch = now + retry_delay
@@ -164,29 +173,29 @@ def run_scheduler(arguments, retry_delay, loop_count):
                 pass
         except AlreadyRunning:
             log.info("第 %s/%s 轮等待运行锁；当前已尝试 %s 次，%s 秒后再检查",
-                     completed + 1, loop_count or "∞", attempt, retry_delay)
+                     completed + 1, loop_count, attempt, retry_delay)
             next_launch = now + retry_delay
-            time.sleep(1)
+            time.sleep(POLL_SECONDS)
             continue
         attempt += 1
         log.info("开始第 %s/%s 轮，第 %s 次尝试（本轮重试 %s 次）",
-                 completed + 1, loop_count or "∞", attempt, attempt - 1)
+                 completed + 1, loop_count, attempt, attempt - 1)
         try:
             process = launch_crawler(arguments)
         except OSError:
             log.exception("第 %s/%s 轮第 %s 次尝试启动失败；%s 秒后重试",
-                          completed + 1, loop_count or "∞", attempt, retry_delay)
+                          completed + 1, loop_count, attempt, retry_delay)
             next_launch = now + retry_delay
 
-    if stopping:
+    if should_stop():
         if process is not None and process.poll() is None:
             log.info("调度器停止；已完成遍历 %s/%s 轮，当前轮已尝试 %s 次；"
                      "独立采集进程 PID=%s 继续运行",
-                     completed, loop_count or "∞", attempt, process.pid)
+                     completed, loop_count, attempt, process.pid)
         else:
             log.info("调度器停止；已完成遍历 %s/%s 轮，当前轮已尝试 %s 次",
-                     completed, loop_count or "∞", attempt)
-    return 0
+                     completed, loop_count, attempt)
+    return completed
 
 
 def main(argv=None):
@@ -198,13 +207,17 @@ def main(argv=None):
         )
     if options.retry_seconds < 1:
         raise ValueError("--retry-seconds 必须大于 0")
-    if options.loop_count < 0:
-        raise ValueError("--loop-count 不能小于 0")
+    if options.loop_count < 1:
+        raise ValueError("--loop-count 必须大于 0")
     arguments = normalize_crawler_args(options.crawler_args)
     if options.check:
+        now = datetime.now(schedule_timezone())
         print("调度配置通过。")
         print("主爬虫参数：", arguments)
-        print("每轮遍历完成后立即开始下一轮；异常中断后按重试间隔再次尝试。")
+        print(f"每天北京时间 {DAILY_HOUR:02d}:{DAILY_MINUTE:02d} 启动 "
+              f"{options.loop_count} 轮；当天各轮连续运行。")
+        print("按当前时间计算，下次启动：", next_scheduled_time(now).isoformat())
+        print("异常中断后按重试间隔再次尝试。")
         return 0
 
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
@@ -216,18 +229,43 @@ def main(argv=None):
             logging.StreamHandler(),
         ],
     )
+    stopping = False
+
+    def request_stop(signum, frame):
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    tz = schedule_timezone()
     try:
         with ProcessLock(SCHEDULER_LOCK):
             log.info(
-                "调度器启动：目标遍历轮数=%s，完成后立即开始下一轮，参数=%s",
-                options.loop_count or "持续",
+                "每日调度器启动：每天 %02d:%02d 开始，每日目标轮数=%s，参数=%s",
+                DAILY_HOUR, DAILY_MINUTE, options.loop_count,
                 arguments,
             )
-            return run_scheduler(
-                arguments,
-                options.retry_seconds,
-                options.loop_count,
-            )
+            while not stopping:
+                target = next_scheduled_time(datetime.now(tz))
+                log.info("等待下次任务：%s", target.isoformat())
+                while not stopping:
+                    remaining = (target - datetime.now(tz)).total_seconds()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(POLL_SECONDS, remaining))
+                if stopping:
+                    break
+                log.info("开始 %s 的每日任务，共 %s 轮",
+                         target.date().isoformat(), options.loop_count)
+                completed = run_scheduler(
+                    arguments, options.retry_seconds, options.loop_count,
+                    should_stop=lambda: stopping,
+                )
+                if completed >= options.loop_count:
+                    log.info("%s 的每日任务已完成，共 %s 轮；等待下一天",
+                             target.date().isoformat(), completed)
+            log.info("停止后续调度；已启动的主爬虫继续完成当前轮。")
+            return 0
     except AlreadyRunning:
         log.error("已有一个调度器正在运行，本次退出")
         return 1
