@@ -159,7 +159,19 @@ nohup .venv/bin/python -u daily_crawler.py \
   > .runtime/scheduler-console.log 2>&1 &
 ```
 
+需要立即手动开始当天批次、不等待 18:00 时加入 `--run-now`；这不会取消后续每日调度：
+
+```bash
+nohup .venv/bin/python -u daily_crawler.py \
+  --run-now \
+  --loop-count 50 \
+  --retry-seconds 60 \
+  -- --all-sites --workers 2 --memory-limit-mib 100 \
+  > .runtime/scheduler-console.log 2>&1 &
+```
+
 - 调度器常驻运行，每天北京时间 18:00 开始当天批次；`--loop-count` 表示每天执行的轮数，默认 50，必须大于 0。
+- `--run-now` 会立即先执行一批相同轮数，完成后继续等待下一次每日 18:00；它不改变线程数、站点范围或其他主爬虫参数。
 - 当天各轮连续执行；完成 50 轮后等待次日 18:00，不退出调度器。
 - `--interval-seconds` 仅为兼容旧命令而保留，只能省略或设为 `0`；不能再设置为 `86400`。
 - 普通失败按 `--retry-seconds` 重试，调度器会自动加入 `--retry-failed`。
@@ -171,6 +183,12 @@ nohup .venv/bin/python -u daily_crawler.py \
 定时使用固定的北京时间 UTC+8，不依赖服务器本地时区配置。`--check` 会显示按当前时间计算的下一次启动时间。
 
 停止调度器只停止后续调度，已启动的主爬虫继续完成当前轮；主爬虫仍持有运行锁，因此重新启动调度器不会造成重叠。
+
+只需手动立即执行一轮、不启动常驻调度器时，原主程序命令仍然可用：
+
+```bash
+.venv/bin/python main.py --all-sites --workers 2 --memory-limit-mib 100
+```
 
 ## 测试
 

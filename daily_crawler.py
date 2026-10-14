@@ -44,6 +44,10 @@ def build_parser():
     )
     parser.add_argument("--check", action="store_true")
     parser.add_argument(
+        "--run-now", action="store_true",
+        help="启动后立即先执行当天批次，完成后继续等待每日定时任务",
+    )
+    parser.add_argument(
         "crawler_args",
         nargs=argparse.REMAINDER,
         help="在 -- 后提供 main.py 参数",
@@ -217,6 +221,8 @@ def main(argv=None):
         print(f"每天北京时间 {DAILY_HOUR:02d}:{DAILY_MINUTE:02d} 启动 "
               f"{options.loop_count} 轮；当天各轮连续运行。")
         print("按当前时间计算，下次启动：", next_scheduled_time(now).isoformat())
+        if options.run_now:
+            print("已指定 --run-now：正式启动时会立即先执行一批，完成后继续每日定时。")
         print("异常中断后按重试间隔再次尝试。")
         return 0
 
@@ -245,16 +251,22 @@ def main(argv=None):
                 DAILY_HOUR, DAILY_MINUTE, options.loop_count,
                 arguments,
             )
+            run_immediately = options.run_now
             while not stopping:
-                target = next_scheduled_time(datetime.now(tz))
-                log.info("等待下次任务：%s", target.isoformat())
-                while not stopping:
-                    remaining = (target - datetime.now(tz)).total_seconds()
-                    if remaining <= 0:
+                if run_immediately:
+                    target = datetime.now(tz)
+                    run_immediately = False
+                    log.info("收到 --run-now，立即开始手动批次")
+                else:
+                    target = next_scheduled_time(datetime.now(tz))
+                    log.info("等待下次任务：%s", target.isoformat())
+                    while not stopping:
+                        remaining = (target - datetime.now(tz)).total_seconds()
+                        if remaining <= 0:
+                            break
+                        time.sleep(min(POLL_SECONDS, remaining))
+                    if stopping:
                         break
-                    time.sleep(min(POLL_SECONDS, remaining))
-                if stopping:
-                    break
                 log.info("开始 %s 的每日任务，共 %s 轮",
                          target.date().isoformat(), options.loop_count)
                 completed = run_scheduler(

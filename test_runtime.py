@@ -207,6 +207,15 @@ class SchedulerTests(unittest.TestCase):
             daily_crawler.build_parser().parse_args([]).loop_count, 50
         )
 
+    def test_run_now_flag_preserves_other_arguments(self):
+        options = daily_crawler.build_parser().parse_args([
+            "--run-now", "--loop-count", "20", "--",
+            "--all-sites", "--workers", "4",
+        ])
+        self.assertTrue(options.run_now)
+        self.assertEqual(options.loop_count, 20)
+        self.assertEqual(options.crawler_args[-3:], ["--all-sites", "--workers", "4"])
+
     def test_next_daily_run_is_1800_china_time(self):
         tz = daily_crawler.schedule_timezone()
         before = datetime(2026, 10, 14, 17, 59, tzinfo=tz)
